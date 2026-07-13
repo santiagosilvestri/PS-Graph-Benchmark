@@ -28,6 +28,10 @@ Run it:
 
 No changes to your `push_swap`, headers, libraries, checker, or Makefile are required.
 
+## Preview
+
+![Push Swap Graph Benchmark preview](benchmark-preview.png)
+
 ## Requirements
 
 The tested program must:
