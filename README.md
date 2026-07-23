@@ -1,33 +1,23 @@
 # Push Swap Graph Benchmark
 
-*A portable terminal benchmark created by **sasilves** for multi-strategy
-`push_swap` implementations.*
+*Created by **Santiago Silvestri** as a portable benchmarking tool for multi-strategy `push_swap` implementations.*
 
-It compares `--simple`, `--medium`, `--complex`, and `--adaptive`, validates the
-operations produced by `push_swap`, and displays the results as a graph.
+A single-file C benchmark that compares `--simple`, `--medium`, `--complex`, and `--adaptive`, validates their output, and displays the results as a terminal graph.
 
-## Quick start
+## Use it in your Push Swap
 
-Copy your compiled `push_swap` executable into the benchmark directory:
+Place `push_swap_benchmark.c` in the same directory as your compiled `push_swap` executable:
 
 ```text
-Push-Swap-Graph-Benchmark/
+push_swap/
 ├── push_swap
-├── push_swap_benchmark.c
-├── Makefile
-└── README.md
-```
-
-For example:
-
-```bash
-cp /path/to/your/push_swap ./push_swap
+└── push_swap_benchmark.c
 ```
 
 Compile the benchmark:
 
 ```bash
-make
+cc -Wall -Wextra -Werror push_swap_benchmark.c -lm -o ps_benchmark
 ```
 
 Run it:
@@ -36,52 +26,7 @@ Run it:
 ./ps_benchmark
 ```
 
-That is all that is required. You do not need Python, an external checker, or
-changes to the source code or Makefile of your own `push_swap` project.
-
-To remove the compiled benchmark:
-
-```bash
-make clean
-```
-
-To compile it again from scratch:
-
-```bash
-make re
-```
-
-You can also compile it without the Makefile:
-
-```bash
-cc -Wall -Wextra -Werror push_swap_benchmark.c -lm -o ps_benchmark
-```
-
-## Common examples
-
-Run the default benchmark:
-
-```bash
-./ps_benchmark
-```
-
-Compare every strategy up to 500 elements:
-
-```bash
-./ps_benchmark --max 500 --algorithms all --runs 10 --seed 42
-```
-
-Compare selected strategies:
-
-```bash
-./ps_benchmark --algorithms medium,complex,adaptive
-```
-
-Show every available option:
-
-```bash
-./ps_benchmark --help
-```
+The benchmark is compiled independently and does not modify your `push_swap`, headers, libraries, or checker.
 
 ## Preview
 
@@ -105,12 +50,18 @@ Example:
 
 The benchmark is intended for Linux, macOS, WSL, and other POSIX-compatible systems.
 
-## More examples
+## Recommended commands
 
-Use more runs for a more stable average:
+Compare every strategy up to 500 elements:
 
 ```bash
-./ps_benchmark --max 500 --samples 10 --runs 10 --seed 42
+./ps_benchmark \
+    --max 500 \
+    --samples 10 \
+    --runs 10 \
+    --algorithms all \
+    --log \
+    --seed 42
 ```
 
 Test a fixed disorder level:
@@ -124,10 +75,10 @@ Test a fixed disorder level:
     --seed 42
 ```
 
-Use a logarithmic graph when the operation counts differ greatly:
+Display all available options:
 
 ```bash
-./ps_benchmark --log
+./ps_benchmark --help
 ```
 
 ## Options
@@ -294,17 +245,17 @@ The rating is based on the benchmark average. It is a performance reference, not
 
 When controlled disorder is used, the benchmark warns that these thresholds are normally intended for random inputs.
 
-## Adaptive strategy
+## Adaptive strategy estimate
 
-The benchmark also reports how many times `--adaptive` selected each internal strategy:
+The benchmark cannot inspect which internal strategy your `--adaptive` implementation actually selected. Instead, it reports an **estimated routing** based on the measured disorder and the benchmark's own thresholds:
 
 ```text
-simple
-medium
-complex
+below 20%        simple
+20% to below 50% medium
+50% or more      complex
 ```
 
-This helps evaluate whether the adaptive thresholds route inputs as expected instead of treating adaptive as an entirely separate sorting algorithm.
+The terminal output labels this value as `Estimated adaptive routing`. Treat it as a reference only. If your adaptive implementation uses different thresholds, the estimate will not represent its real internal decision.
 
 ## Safety conditions
 
@@ -317,7 +268,6 @@ The benchmark includes protections against accidental heavy executions:
 - timeout for each child process;
 - maximum accepted operation count;
 - termination of blocked or excessively long processes;
-- cleanup of the active child process group when the benchmark is interrupted;
 - validation that `./push_swap` exists and is executable.
 
 Large values remain expensive even when permitted. Start with 100 or 500 elements before testing larger inputs.
@@ -334,14 +284,15 @@ Large values remain expensive even when permitted. Start with 100 or 500 element
 
 ## Repository structure
 
+The standalone repository only needs:
+
 ```text
 Push-Swap-Graph-Benchmark/
-├── Makefile
-├── README.md
+├── push_swap_benchmark.c
 ├── benchmark-preview.png
-└── push_swap_benchmark.c
+└── README.md
 ```
 
 ## Author
 
-Developed by **sasilves**.
+Developed by **Santiago Silvestri**.
