@@ -62,6 +62,9 @@
 #define RESET "\033[0m"
 #define BOLD "\033[1m"
 
+static volatile sig_atomic_t	g_active_child_pid;
+static volatile sig_atomic_t	g_stop_signal;
+
 typedef struct s_config
 {
     int             max_n;
@@ -101,6 +104,7 @@ typedef struct s_progress
 void        progress_init(t_progress *progress, int total);
 void        progress_advance(t_progress *progress);
 void        progress_finish(t_progress *progress);
+void        progress_abort(t_progress *progress);
 int         parse_config(int argc, char **argv, t_config *config);
 void        print_usage(const char *program);
 int         selected_count(unsigned int mask);
@@ -114,7 +118,46 @@ int         run_push_swap(int algorithm, int *values, int size,
 void        write_terminal_chart(t_config *config, t_result *results,
                 int count);
 int         verify_push_swap_output(int fd, pid_t pid, int *values, int size,
-                int timeout_seconds);
+                int timeout_seconds, struct timespec *start);
+
+static void	stop_signal_handler(int signal_number)
+{
+	pid_t	pid;
+
+	g_stop_signal = signal_number;
+	pid = (pid_t)g_active_child_pid;
+	if (pid > 0)
+	{
+		kill(-pid, SIGKILL);
+		kill(pid, SIGKILL);
+	}
+	else
+		_exit(128 + signal_number);
+}
+
+static int	install_stop_signal_handlers(void)
+{
+	struct sigaction	action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = stop_signal_handler;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGINT, &action, NULL) < 0
+		|| sigaction(SIGTERM, &action, NULL) < 0
+		|| sigaction(SIGHUP, &action, NULL) < 0
+		|| sigaction(SIGQUIT, &action, NULL) < 0)
+		return (0);
+	return (1);
+}
+
+static void	fill_stop_signal_set(sigset_t *set)
+{
+	sigemptyset(set);
+	sigaddset(set, SIGINT);
+	sigaddset(set, SIGTERM);
+	sigaddset(set, SIGHUP);
+	sigaddset(set, SIGQUIT);
+}
 
 /* ===== benchmark_args.c ===== */
 
@@ -139,6 +182,8 @@ static int	parse_seed(const char *text, unsigned int *seed)
 	char			*end;
 	unsigned long	number;
 
+	if (text[0] == '-')
+		return (0);
 	errno = 0;
 	number = strtoul(text, &end, 10);
 	if (errno || *text == '\0' || *end != '\0' || number > UINT_MAX)
@@ -164,11 +209,14 @@ static int	parse_algorithms(const char *text, unsigned int *mask)
 {
 	char	copy[128];
 	char	*token;
+	size_t	length;
 	int		index;
 
-	if (strlen(text) >= sizeof(copy))
+	length = strlen(text);
+	if (length == 0 || length >= sizeof(copy) || text[0] == ','
+		|| text[length - 1] == ',' || strstr(text, ",,") != NULL)
 		return (0);
-	strcpy(copy, text);
+	memcpy(copy, text, length + 1);
 	if (strcmp(copy, "all") == 0)
 		return (*mask = MASK_ALL, 1);
 	*mask = 0;
@@ -284,8 +332,9 @@ static int	validate_workload(t_config *config)
 		&& config->max_n > MAX_SIMPLE_ELEMENTS)
 		return (fprintf(stderr, "Error: simple is limited to %d elements.\n",
 				MAX_SIMPLE_ELEMENTS), 0);
-	executions = (unsigned long long)effective_samples(config) * config->runs
-		* selected_count(config->algorithms);
+	executions = (unsigned long long)effective_samples(config)
+		* (unsigned long long)config->runs
+		* (unsigned long long)selected_count(config->algorithms);
 	if (executions > MAX_EXECUTIONS)
 		return (fprintf(stderr, "Error: maximum benchmark executions: %d.\n",
 				MAX_EXECUTIONS), 0);
@@ -484,7 +533,7 @@ static int	fenwick_select(int *tree, int size, int rank)
 
 static unsigned long long	max_inversions(int size)
 {
-	return ((unsigned long long)size * (size - 1) / 2);
+	return ((unsigned long long)size * (unsigned long long)(size - 1) / 2);
 }
 
 static int	controlled_values(int *values, int size, int disorder,
@@ -505,7 +554,7 @@ static int	controlled_values(int *values, int size, int disorder,
 	position = 0;
 	while (position < size)
 		fenwick_add(tree, size, position++, 1);
-	remaining = (max_inversions(size) * disorder + 50) / 100;
+	remaining = (max_inversions(size) * (unsigned long long)disorder + 50) / 100;
 	position = 0;
 	while (position < size)
 	{
@@ -806,40 +855,93 @@ static long long	elapsed_milliseconds(struct timespec *start)
 		+ (now.tv_nsec - start->tv_nsec) / 1000000LL);
 }
 
+static void	kill_child_processes(pid_t pid)
+{
+	if (pid <= 0)
+		return ;
+	kill(-pid, SIGKILL);
+	kill(pid, SIGKILL);
+}
+
 static int	read_output(int fd, pid_t pid, t_verifier *verifier,
-		int timeout_seconds)
+		int timeout_seconds, struct timespec *start)
 {
 	struct pollfd	pollfd;
-	struct timespec	start;
 	char			buffer[4096];
 	ssize_t			bytes;
 	int				status;
 
 	pollfd.fd = fd;
 	pollfd.events = POLLIN | POLLHUP;
-	clock_gettime(CLOCK_MONOTONIC, &start);
 	while (1)
 	{
-		if (elapsed_milliseconds(&start) > timeout_seconds * 1000LL)
-			return (kill(pid, SIGKILL), -2);
+		if (elapsed_milliseconds(start) > timeout_seconds * 1000LL)
+			return (kill_child_processes(pid), -2);
 		status = poll(&pollfd, 1, 100);
 		if (status < 0 && errno != EINTR)
-			return (kill(pid, SIGKILL), -1);
+			return (kill_child_processes(pid), -1);
 		if (status <= 0)
 			continue ;
 		bytes = read(fd, buffer, sizeof(buffer));
 		if (bytes == 0)
 			break ;
 		if (bytes < 0 && errno != EINTR)
-			return (kill(pid, SIGKILL), -1);
+			return (kill_child_processes(pid), -1);
 		if (bytes > 0 && !feed_buffer(verifier, buffer, bytes))
-			return (kill(pid, SIGKILL), -3);
+			return (kill_child_processes(pid), -3);
 	}
 	return (0);
 }
 
+static int	wait_for_child(pid_t pid, int *status, int timeout_seconds,
+		struct timespec *start)
+{
+	pid_t	result;
+	struct timespec	pause;
+	sigset_t	stop_set;
+	sigset_t	previous_mask;
+	int		mask_status;
+
+	pause.tv_sec = 0;
+	pause.tv_nsec = 10000000L;
+	fill_stop_signal_set(&stop_set);
+	while (1)
+	{
+		mask_status = sigprocmask(SIG_BLOCK, &stop_set, &previous_mask);
+		if (mask_status < 0)
+			return (kill_child_processes(pid), 0);
+		result = waitpid(pid, status, WNOHANG);
+		if (result == pid)
+		{
+			g_active_child_pid = 0;
+			if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) < 0)
+				return (0);
+			return (1);
+		}
+		if (result < 0 && errno != EINTR)
+		{
+			g_active_child_pid = 0;
+			sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+			return (0);
+		}
+		if (elapsed_milliseconds(start) > timeout_seconds * 1000LL)
+		{
+			kill_child_processes(pid);
+			do
+				result = waitpid(pid, status, 0);
+			while (result < 0 && errno == EINTR);
+			g_active_child_pid = 0;
+			sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+			return (-2);
+		}
+		if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) < 0)
+			return (kill_child_processes(pid), 0);
+		nanosleep(&pause, NULL);
+	}
+}
+
 int	verify_push_swap_output(int fd, pid_t pid, int *values, int size,
-		int timeout_seconds)
+		int timeout_seconds, struct timespec *start)
 {
 	t_verifier	verifier;
 	int			status;
@@ -847,7 +949,7 @@ int	verify_push_swap_output(int fd, pid_t pid, int *values, int size,
 
 	if (!verifier_init(&verifier, values, size))
 		return (-1);
-	status = read_output(fd, pid, &verifier, timeout_seconds);
+	status = read_output(fd, pid, &verifier, timeout_seconds, start);
 	operations = verifier.operations;
 	if (status == 0 && verifier.line_length != 0)
 		status = -3;
@@ -868,7 +970,7 @@ static char	**build_arguments(int algorithm, int *values, int size,
 	char	**args;
 	int		i;
 
-	args = malloc(sizeof(char *) * (size + 3));
+	args = malloc(sizeof(*args) * ((size_t)size + 3));
 	*storage = malloc((size_t)size * 16);
 	if (!args || !*storage)
 		return (free(args), free(*storage), NULL);
@@ -919,13 +1021,29 @@ static void	print_verification_error(int code, int algorithm, int size,
 		fprintf(stderr, "could not read or validate the output.\n");
 }
 
+static void	print_child_error(int status, int algorithm, int size)
+{
+	fprintf(stderr, "\nError: %s failed for %d elements: ",
+		algorithm_name(algorithm), size);
+	if (WIFEXITED(status))
+		fprintf(stderr, "process exited with status %d.\n", WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		fprintf(stderr, "process terminated by signal %d.\n", WTERMSIG(status));
+	else
+		fprintf(stderr, "process did not terminate normally.\n");
+}
+
 int	run_push_swap(int algorithm, int *values, int size, t_config *config)
 {
 	char	**args;
 	char	*storage;
 	int		pipefd[2];
 	pid_t	pid;
+	struct timespec	start;
+	sigset_t	stop_set;
+	sigset_t	previous_mask;
 	int		status;
+	int		wait_status;
 	int		operations;
 
 	storage = NULL;
@@ -934,26 +1052,62 @@ int	run_push_swap(int algorithm, int *values, int size, t_config *config)
 		return (-1);
 	if (pipe(pipefd) < 0)
 		return (free(args), free(storage), -1);
-	pid = fork();
-	if (pid < 0)
+	fill_stop_signal_set(&stop_set);
+	if (sigprocmask(SIG_BLOCK, &stop_set, &previous_mask) < 0)
 		return (close(pipefd[0]), close(pipefd[1]), free(args),
 			free(storage), -1);
+	if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+		return (sigprocmask(SIG_SETMASK, &previous_mask, NULL),
+			close(pipefd[0]), close(pipefd[1]), free(args), free(storage), -1);
+	pid = fork();
+	if (pid < 0)
+		return (sigprocmask(SIG_SETMASK, &previous_mask, NULL),
+			close(pipefd[0]), close(pipefd[1]), free(args), free(storage), -1);
 	if (pid == 0)
+	{
+		if (setpgid(0, 0) < 0)
+			_exit(126);
+		sigprocmask(SIG_SETMASK, &previous_mask, NULL);
 		run_child(pipefd, args);
+	}
+	if (setpgid(pid, pid) < 0 && errno != EACCES && errno != ESRCH)
+	{
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+		return (close(pipefd[0]), close(pipefd[1]), free(args),
+			free(storage), -1);
+	}
+	g_active_child_pid = (sig_atomic_t)pid;
+	if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) < 0)
+	{
+		kill_child_processes(pid);
+		waitpid(pid, NULL, 0);
+		g_active_child_pid = 0;
+		return (close(pipefd[0]), close(pipefd[1]), free(args),
+			free(storage), -1);
+	}
 	close(pipefd[1]);
 	operations = verify_push_swap_output(pipefd[0], pid, values, size,
-			config->timeout_seconds);
+			config->timeout_seconds, &start);
 	close(pipefd[0]);
-	if (waitpid(pid, &status, 0) < 0)
+	wait_status = wait_for_child(pid, &status, config->timeout_seconds, &start);
+	if (wait_status == -2)
+		operations = -2;
+	else if (wait_status == 0)
 		operations = -1;
 	free(args);
 	free(storage);
-	if (operations < 0)
+	if (g_stop_signal != 0)
+		return (-1);
+	if (operations == -1 || operations == -2 || operations == -3)
 		return (print_verification_error(operations, algorithm, size,
 				config->timeout_seconds), -1);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-		return (fprintf(stderr, "\nError: %s exited unsuccessfully for %d "
-				"elements.\n", algorithm_name(algorithm), size), -1);
+		return (print_child_error(status, algorithm, size), -1);
+	if (operations == -4)
+		return (print_verification_error(operations, algorithm, size,
+				config->timeout_seconds), -1);
 	return (operations);
 }
 
@@ -961,13 +1115,53 @@ int	run_push_swap(int algorithm, int *values, int size, t_config *config)
 
 static void	print_progress_bar(t_progress *progress, int percent)
 {
+	struct winsize	window;
+	const char		*label;
+	char			suffix[64];
+	char			compact[64];
+	int			bar_width;
+	int			columns;
+	int			max_width;
 	int	filled;
 	int	i;
 
-	filled = percent * PROGRESS_WIDTH / 100;
-	printf("\r\033[2KPortable Push Swap Graph Benchmark by sasilves [");
+	columns = 0;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0)
+		columns = window.ws_col;
+	max_width = columns - 1;
+	if (columns <= 0)
+		max_width = INT_MAX;
+	label = "Portable Push Swap Graph Benchmark by sasilves ";
+	snprintf(suffix, sizeof(suffix), "] %3d%% (%d/%d)", percent,
+		progress->current, progress->total);
+	bar_width = PROGRESS_WIDTH;
+	if (max_width != INT_MAX)
+		bar_width = max_width - (int)strlen(label) - (int)strlen(suffix) - 1;
+	if (bar_width < 8)
+	{
+		label = "PS benchmark ";
+		bar_width = max_width - (int)strlen(label) - (int)strlen(suffix) - 1;
+	}
+	printf("\r\033[2K");
+	if (bar_width < 1)
+	{
+		snprintf(compact, sizeof(compact), "%3d%% (%d/%d)", percent,
+			progress->current, progress->total);
+		if ((int)strlen(compact) <= max_width)
+			printf("%s", compact);
+		else if (max_width >= 4)
+			printf("%3d%%", percent);
+		else if (max_width >= 3)
+			printf("%3d", percent);
+		fflush(stdout);
+		return ;
+	}
+	if (bar_width > PROGRESS_WIDTH)
+		bar_width = PROGRESS_WIDTH;
+	filled = percent * bar_width / 100;
+	printf("%s[", label);
 	i = 0;
-	while (i < PROGRESS_WIDTH)
+	while (i < bar_width)
 	{
 		if (i < filled)
 			printf("%s█%s", GREEN, RESET);
@@ -975,8 +1169,7 @@ static void	print_progress_bar(t_progress *progress, int percent)
 			printf("░");
 		i++;
 	}
-	printf("] %3d%% (%d/%d)", percent, progress->current,
-		progress->total);
+	printf("%s", suffix);
 	fflush(stdout);
 }
 
@@ -1001,8 +1194,6 @@ void	progress_init(t_progress *progress, int total)
 	progress->total = total;
 	progress->last_percent = -1;
 	progress->interactive = isatty(STDOUT_FILENO);
-	if (progress->interactive)
-		printf("\033[?25l");
 	progress_update(progress);
 }
 
@@ -1018,10 +1209,20 @@ void	progress_finish(t_progress *progress)
 	progress->current = progress->total;
 	progress_update(progress);
 	if (progress->interactive)
-		printf("\n\033[?25h");
+		printf("\n");
 	else
 		printf("Portable Push Swap Graph Benchmark by sasilves: 100%% (%d/%d)\n",
 			progress->total, progress->total);
+	fflush(stdout);
+}
+
+void	progress_abort(t_progress *progress)
+{
+	if (progress->interactive)
+		printf("\n");
+	else
+		printf("Portable Push Swap Graph Benchmark by sasilves: stopped (%d/%d)\n",
+			progress->current, progress->total);
 	fflush(stdout);
 }
 
@@ -1032,7 +1233,7 @@ static int	terminal_width(void)
 	struct winsize	window;
 
 	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0
-		&& window.ws_col > 40)
+		&& window.ws_col > 0)
 		return ((int)window.ws_col);
 	return (120);
 }
@@ -1118,19 +1319,26 @@ static int	visible_groups(t_config *config, int count, int *bar_width,
 	int	available;
 	int	selected;
 	int	groups;
+	int	label_width;
+	char	label[32];
 
 	available = terminal_width() - 12;
 	selected = selected_count(config->algorithms);
+	label_width = snprintf(label, sizeof(label), "%d", config->max_n);
 	*bar_width = 2;
 	*group_width = selected * (*bar_width + 1) + 1;
+	if (*group_width < label_width)
+		*group_width = label_width;
 	if (*group_width * count > available)
 	{
 		*bar_width = 1;
 		*group_width = selected * 2 + 1;
+		if (*group_width < label_width)
+			*group_width = label_width;
 	}
 	groups = available / *group_width;
-	if (groups < 2)
-		groups = 2;
+	if (groups < 1)
+		groups = 1;
 	if (groups > count)
 		groups = count;
 	return (groups);
@@ -1211,7 +1419,7 @@ static void	print_bar_cell(const char *cell, int algorithm, int width,
 }
 
 static void	print_chart_row(t_config *config, t_result *results, int count,
-		int shown, int bar_width, double maximum, int row)
+		int shown, int bar_width, int group_width, double maximum, int row)
 {
 	int	grid;
 	int	tick;
@@ -1219,6 +1427,8 @@ static void	print_chart_row(t_config *config, t_result *results, int count,
 	int	algorithm;
 	int	index;
 	int	color;
+	int	padding;
+	int	used_width;
 
 	grid = grid_tick(row, config->chart_height, &tick);
 	if (grid)
@@ -1244,6 +1454,10 @@ static void	print_chart_row(t_config *config, t_result *results, int count,
 			algorithm++;
 		}
 		printf(grid ? "─" : " ");
+		used_width = selected_count(config->algorithms) * (bar_width + 1) + 1;
+		padding = group_width - used_width;
+		while (padding-- > 0)
+			printf(grid ? "─" : " ");
 		i++;
 	}
 	printf("\n");
@@ -1362,7 +1576,7 @@ static void	print_adaptive_routes(t_config *config, t_result *result)
 {
 	if (!(config->algorithms & (1U << ALG_ADAPTIVE)))
 		return ;
-	printf("Adaptive routing at %d elements: simple %d, medium %d, "
+	printf("Estimated adaptive routing at %d elements: simple %d, medium %d, "
 		"complex %d\n", result->n,
 		result->adaptive_routes[ROUTE_SIMPLE],
 		result->adaptive_routes[ROUTE_MEDIUM],
@@ -1419,7 +1633,8 @@ void	write_terminal_chart(t_config *config, t_result *results, int count)
 	row = 0;
 	while (row < config->chart_height)
 	{
-		print_chart_row(config, results, count, shown, bar_width, maximum, row);
+		print_chart_row(config, results, count, shown, bar_width, group_width,
+			maximum, row);
 		row++;
 	}
 	print_x_axis(results, count, shown, group_width);
@@ -1575,6 +1790,8 @@ static int	benchmark_size(t_config *config, t_result *result,
 	run = 0;
 	while (run < config->runs)
 	{
+		if (g_stop_signal != 0)
+			return (free(values), 0);
 		if (!generate_values(values, result->n, config))
 			return (free(values), 0);
 		disorder = measure_disorder(values, result->n);
@@ -1621,7 +1838,7 @@ static int	run_benchmark(t_config *config, t_result *results, int count)
 	{
 		if (!benchmark_size(config, &results[i], &progress))
 		{
-			progress_finish(&progress);
+			progress_abort(&progress);
 			return (0);
 		}
 		i++;
@@ -1649,8 +1866,15 @@ int	main(int argc, char **argv)
 		return (perror("calloc"), 1);
 	set_sizes(&config, results, count);
 	print_configuration(&config, count);
+	if (!install_stop_signal_handlers())
+		return (free(results), perror("sigaction"), 1);
 	if (!run_benchmark(&config, results, count))
-		return (free(results), fprintf(stderr, "Benchmark failed.\n"), 1);
+	{
+		free(results);
+		if (g_stop_signal != 0)
+			return (128 + g_stop_signal);
+		return (fprintf(stderr, "Benchmark failed.\n"), 1);
+	}
 	write_terminal_chart(&config, results, count);
 	free(results);
 	return (0);
